@@ -5,6 +5,8 @@ from traceback import print_exc
 import mutagen
 import os
 import subprocess
+import time
+from multiprocessing import Pool, cpu_count
 
 RELEVANT_PV_KEYS = ["song_name_en", "songinfo_en", "bpm", "date", "lyric_en"]
 
@@ -47,6 +49,43 @@ def parse_pv_db(fd):
 
     return all_pv_data
 
+def do_encode(t):
+    this_pv_data, pv_ogg, full_pv_path, this_destination = t
+    try:
+        
+        cmd = [
+            "ffmpeg",
+            "-loglevel", "error",
+            "-y",
+            "-i", full_pv_path,
+            "-filter_complex", "[0:a]channelsplit=channel_layout=quad[sl][sr][vl][vr],[sl][vl]amix=inputs=2[fl],[sr][vr]amix=inputs=2[fr],[fl][fr]join=inputs=2:channel_layout=stereo[fa]",
+            "-map", "[fa]",
+            "-b:a", "128k",
+            this_destination                
+        ]
+        # ffmpeg -i pv_096.ogg -filter_complex "[0:a]channelsplit=channel_layout=quad[sl][sr][vl][vr],[sl][vl]amix=inputs=2[fl],[sr][vr]amix=inputs=2[fr],[fl][fr]join=inputs=2:channel_layout=stereo[fa]" -map "[fa]" /tmp/test.ogg
+        ret = subprocess.run(cmd)
+        if (status := ret.returncode) != 0:
+            raise RuntimeError(f"ffmpeg failed with {status=}")
+        audio_obj = mutagen.File(this_destination)
+        audio_obj["title"] = this_pv_data["name"]
+        year = this_pv_data["date"][:4]
+        month = this_pv_data["date"][4:6]
+        date = this_pv_data["date"][6:8]
+        audio_obj["date"] = f"{year}/{month}/{date}"
+        audio_obj["artist"] = this_pv_data["music"]
+        audio_obj["album"] = "Project Diva MegaMix+"
+        audio_obj["track"] = pv_ogg[3:6]
+        audio_obj["lyrics"] = "\n".join(this_pv_data["lyrics"])
+        audio_obj["bpm"] = this_pv_data["bpm"]
+        audio_obj.save()
+        return True
+    except Exception as e:
+        print(f"failed {pv_ogg=} {type(e)}")
+        print_exc()
+        return False
+    
+
 if __name__ == "__main__":
     if len(sys.argv) != 4:
         print("usage: ./db_tag.py path/to/songs path/to/pv_db.txt output/dir")
@@ -64,6 +103,7 @@ if __name__ == "__main__":
 
     os.makedirs(destination_path, exist_ok=True)
     total_count = len(os.listdir(source_path))
+    pv_job_info = []
     for index, pv_ogg in enumerate(os.listdir(source_path)):
         full_pv_path = os.path.join(source_path, pv_ogg)
         if not os.path.isfile(full_pv_path) or not re.search("pv_\\d{3}.ogg", pv_ogg):
@@ -72,42 +112,22 @@ if __name__ == "__main__":
             continue
 
         try:
-            print(f"processing {index}/{total_count}\r", end="")
             this_pv_data = all_pv_data[pv_ogg[:6]]
             song_name = this_pv_data["name"]
             this_destination = os.path.join(destination_path, song_name.replace(" ", "_").replace("/","_")+".ogg")
-            cmd = [
-                "ffmpeg",
-                "-loglevel", "error",
-                "-y",
-                "-i", full_pv_path,
-                "-filter_complex", "[0:a]channelsplit=channel_layout=quad[sl][sr][vl][vr],[sl][vl]amix=inputs=2[fl],[sr][vr]amix=inputs=2[fr],[fl][fr]join=inputs=2:channel_layout=stereo[fa]",
-                "-map", "[fa]",
-                "-b:a", "128k",
-                this_destination                
-            ]
-            # ffmpeg -i pv_096.ogg -filter_complex "[0:a]channelsplit=channel_layout=quad[sl][sr][vl][vr],[sl][vl]amix=inputs=2[fl],[sr][vr]amix=inputs=2[fr],[fl][fr]join=inputs=2:channel_layout=stereo[fa]" -map "[fa]" /tmp/test.ogg
-            ret = subprocess.run(cmd)
-            if (status := ret.returncode) != 0:
-                raise RuntimeError(f"ffmpeg failed with {status=}")
-            audio_obj = mutagen.File(this_destination)
-            audio_obj["title"] = this_pv_data["name"]
-            year = this_pv_data["date"][:4]
-            month = this_pv_data["date"][4:6]
-            date = this_pv_data["date"][6:8]
-            audio_obj["date"] = f"{year}/{month}/{date}"
-            audio_obj["artist"] = this_pv_data["music"]
-            audio_obj["album"] = "Project Diva MegaMix+"
-            audio_obj["track"] = pv_ogg[3:6]
-            audio_obj["lyrics"] = "\n".join(this_pv_data["lyrics"])
-            audio_obj["bpm"] = this_pv_data["bpm"]
-            audio_obj.save()
-            ok+=1
-        except Exception as e:
-            failed += 1
-            print(f"failed {pv_ogg=} {type(e)}")
-            print_exc()
+            o = (this_pv_data, pv_ogg, full_pv_path, this_destination)
+            pv_job_info.append(o)
+        except KeyError:
+            failed+=1
+        
+    cpus = cpu_count()
+    with Pool(processes=cpus) as pool:
+        start = time.time()
+        results = pool.map(do_encode, pv_job_info)
+        elapsed = time.time() - start
+        ok = sum(1 for x in results if x == True)
+        print(f"{ok=} {skipped=} {failed=} in {elapsed:.1f}s ({cpus=})")
+
     
 
-    print(f"{ok=} {skipped=} {failed=}")
         
